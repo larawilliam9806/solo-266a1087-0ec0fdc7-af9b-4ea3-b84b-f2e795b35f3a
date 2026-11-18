@@ -34,12 +34,21 @@
 1. **同字节复用**：同一 `SOPInstanceUID` 且原文件 SHA-256 相同，直接复用既有处理结果。
 2. **字节冲突整批拒绝**：同一 `SOPInstanceUID` 但字节不同，整个批次标记 `failed`，
    不产生任何可下载产物。并发首次提交的竞态由 IMMEDIATE 事务内的哈希比对兜底。
-3. **无半批可下载**：批次只有在全部文件处理、入库、zip 打包并原子 rename 成功后才置为 `ready`；
-   zip 先写临时文件再 `os.replace`，失败/中断的批次下载返回 409。
-4. **重启恢复**：进程启动时将遗留的 `processing` 批次标记 `failed`；已成功入库的实例与映射
-   **保留不丢**，重新上传即可复用且标识不变。
-5. **重试不变号**：确定性派生 + 映射表只插入不更新（`INSERT OR IGNORE`），重试绝不改变标识。
-6. **先落盘后入库**：对象文件 `fsync` + 原子 rename 后才写数据库记录。
+3. **检查归属唯一（一个原 Study UID 只归属一个原 PatientID）**：
+   - 归属只取自实例**顶层** `StudyInstanceUID` / `PatientID`；SR 等文档在嵌套序列中
+     引用外部 Study 不构成拥有，不会把外部 Study 记到自己名下。
+   - 同一批次内一个 Study UID 出现两个不同 PatientID → 整批拒绝。
+   - 跨批次（含并发首传）与已发布归属冲突时，只有归属一致的批次能发布成功；
+     归属登记与批次置 `ready` 在同一个 IMMEDIATE 事务内提交，并发冲突至多一批成功。
+   - 归属仅由成功发布的批次写入 `study_ownership` 表；失败/中断批次留下的实例与映射
+     **不占用归属**，随后上传未与已发布归属冲突的影像仍可成功。
+   - 同一患者的后续序列、同字节重传始终可用；失败批次返回 409 不可下载，既有批次不变。
+4. **无半批可下载**：批次只有在全部文件处理、入库、zip 打包并原子 rename 成功后才置为 `ready`；
+   zip 先写临时文件再 `os.replace`，失败/中断的批次下载返回 409，其半成品 zip 会被清理。
+5. **重启恢复**：进程启动时将遗留的 `processing` 批次标记 `failed`；已成功入库的实例与映射
+   **保留不丢**，重新上传即可复用且标识不变（归属未确立，不影响后续发布）。
+6. **重试不变号**：确定性派生 + 映射表只插入不更新（`INSERT OR IGNORE`），重试绝不改变标识。
+7. **先落盘后入库**：对象文件 `fsync` + 原子 rename 后才写数据库记录。
 
 ## 目录结构
 
@@ -72,7 +81,7 @@ docker compose up --build
 
 数据持久化在命名卷 `dicom_data`（容器内 `/data`），包含：
 
-- `dicom.db`（SQLite，WAL 模式）
+- `dicom.db`（SQLite，WAL 模式；含 `study_ownership` 检查归属表）
 - `objects/`（内容寻址的处理后 DICOM）
 - `tmp/`（上传暂存，按批次隔离，结束即清理）
 - `batches/`（最终 zip，原子写入）
@@ -86,7 +95,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 # 生成含跨文件引用的合成样例
 python samples/generate_samples.py
 
-# 运行测试（15 个，含多进程并发）
+# 运行测试（29 个，含多进程并发、中断恢复与检查归属不变量）
 pytest -q
 
 # 本地启动

@@ -3,7 +3,9 @@
 设计要点：
 - WAL + busy_timeout + 每次写事务使用 IMMEDIATE，保证多 gunicorn worker 并发安全；
 - 标识映射（UID/PatientID）全局唯一且只插入、不更新，保证跨批次一致与重试不变号；
-- 实例按 (原 SOP UID, 原文件 sha256) 去重，字节不同直接冲突，由上层整批拒绝。
+- 实例按 (原 SOP UID, 原文件 sha256) 去重，字节不同直接冲突，由上层整批拒绝；
+- study_ownership 记录“已发布批次”确立的检查归属权：一个原 StudyInstanceUID
+  只能归属一个原 PatientID；失败/中断批次从不写入该表，不占用归属。
 """
 from __future__ import annotations
 
@@ -58,6 +60,16 @@ CREATE TABLE IF NOT EXISTS batch_files (
 
 CREATE INDEX IF NOT EXISTS idx_batch_files_sop ON batch_files(sop_uid);
 CREATE INDEX IF NOT EXISTS idx_instances_sha  ON instances(sha256);
+
+-- 检查归属权：仅由成功发布（ready）的批次在发布事务中写入。
+-- 一个原 StudyInstanceUID 全局只能归属一个原 PatientID；IMMEDIATE 事务
+-- 串行化发布（INSERT OR IGNORE + 回读校验），保证并发首传冲突至多一批成功。
+CREATE TABLE IF NOT EXISTS study_ownership (
+    original_study_uid    TEXT PRIMARY KEY,
+    original_patient_id   TEXT NOT NULL DEFAULT '',
+    batch_id              TEXT NOT NULL REFERENCES batches(id),
+    created_at            TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

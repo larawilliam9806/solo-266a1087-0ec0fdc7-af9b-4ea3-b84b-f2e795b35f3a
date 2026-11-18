@@ -7,6 +7,11 @@
     清空 PatientName、替换 PatientID；Study/Series/SOP 三类 UID 及全部嵌套引用统一换号；
     SOP Class UID、Transfer Syntax UID、像素数据保持原样。同 UID 字节冲突将整批拒绝。
   </p>
+  <p class="muted">
+    检查归属规则：一个原 StudyInstanceUID 只能归属一个原 PatientID（仅依据实例顶层字段，
+    SR 等文档对外部 Study 的嵌套引用不代表拥有）。同批归属冲突整批拒绝；与已发布批次归属
+    冲突的批次不可下载，既有批次不受影响；失败或中断的批次不占用归属，可修正后重新上传。
+  </p>
   <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
     <p><input type="file" name="dicom_files" webkitdirectory multiple required></p>
     <p class="muted">可选择文件夹或多选文件；未选择目录时直接多选文件即可。</p>

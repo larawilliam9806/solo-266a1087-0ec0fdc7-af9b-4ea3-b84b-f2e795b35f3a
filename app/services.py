@@ -58,6 +58,14 @@ def _mark_failed(batch_id: str, error: str) -> None:
         conn.close()
 
 
+def _discard_zip(batch_id: str) -> None:
+    """失败批次若已生成 zip 文件（尚未置 ready），删除以免遗留半成品。"""
+    stale = config.get_batches_dir() / f"{batch_id}.zip"
+    stale.unlink(missing_ok=True)
+    tmp = config.get_batches_dir() / f".{batch_id}.zip.tmp"
+    tmp.unlink(missing_ok=True)
+
+
 def _build_manifest(batch_id: str) -> bytes:
     """生成 CSV 映射清单，随 zip 交付供数据湖关联。"""
     conn = get_db()
@@ -159,6 +167,9 @@ def run_batch(batch_id: str, saved: list[tuple[str, Path]]):
         conn = get_db()
         try:
             with immediate_tx(conn):
+                # 发布事务内权威确立检查归属：并发冲突在此被串行化拦截，
+                # 冲突批次拿不到 ready 状态，其 zip 不会对外提供下载。
+                dicom_proc.claim_study_ownership(conn, plan, batch_id)
                 conn.execute(
                     "UPDATE batches SET status='ready', zip_path=?, "
                     "finished_at=datetime('now') WHERE id=?",
@@ -168,9 +179,11 @@ def run_batch(batch_id: str, saved: list[tuple[str, Path]]):
             conn.close()
         return batch_id
     except dicom_proc.BatchRejected as exc:
+        _discard_zip(batch_id)
         _mark_failed(batch_id, f"整批拒绝: {exc}")
         raise BatchError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
+        _discard_zip(batch_id)
         _mark_failed(batch_id, f"处理失败: {exc}")
         raise
     finally:

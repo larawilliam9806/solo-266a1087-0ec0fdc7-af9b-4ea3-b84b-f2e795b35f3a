@@ -81,6 +81,10 @@ class BatchPlan:
     # 全局值 -> 新 UID
     uid_remap: dict[str, str] = field(default_factory=dict)
     patient_remap: dict[str, str] = field(default_factory=dict)
+    # 检查归属声明：原 StudyInstanceUID -> 原 PatientID。
+    # 只取自实例顶层 StudyInstanceUID/PatientID；SR 等对外部 Study 的
+    # 嵌套引用不构成拥有，不进入此映射。
+    study_owners: dict[str, str] = field(default_factory=dict)
 
 
 def sha256_file(path: Path) -> str:
@@ -203,6 +207,17 @@ def plan_batch(tmp_files: list[tuple[str, Path]]) -> BatchPlan:
             plan.files.append(pf)
             seen_sop[sop_uid] = digest
 
+            # 检查归属仅取自实例顶层字段：同一原 Study UID 在本批内
+            # 只能对应同一个原 PatientID，否则整批拒绝。嵌套引用（如 SR
+            # 对外部 Study 的引用）不在此收集，不代表拥有该 Study。
+            owner = plan.study_owners.get(study_uid)
+            if owner is not None and owner != patient_id:
+                raise BatchRejected(
+                    f"原 StudyInstanceUID {study_uid} 在批次内同时归属不同 "
+                    f"PatientID（{owner} 与 {patient_id}），整批拒绝"
+                )
+            plan.study_owners[study_uid] = patient_id
+
             # 1) 身份 UID 优先登记角色
             for uid, role in (
                 (study_uid, "study"),
@@ -244,6 +259,24 @@ def plan_batch(tmp_files: list[tuple[str, Path]]) -> BatchPlan:
                         f"本批为 {wanted}，整批拒绝"
                     )
                 plan.value_roles[row["original_uid"]] = row["role"]
+
+        # 3.5) 与已发布批次确立的检查归属核对：一个原 Study UID 只归属一个
+        #      原 PatientID。失败/中断批次从不写 study_ownership，故不会占位。
+        if plan.study_owners:
+            placeholders = ",".join("?" * len(plan.study_owners))
+            owned = conn.execute(
+                f"SELECT original_study_uid, original_patient_id "
+                f"FROM study_ownership "
+                f"WHERE original_study_uid IN ({placeholders})",
+                tuple(plan.study_owners),
+            ).fetchall()
+            for row in owned:
+                wanted = plan.study_owners.get(row["original_study_uid"])
+                if wanted is not None and wanted != row["original_patient_id"]:
+                    raise BatchRejected(
+                        f"原 StudyInstanceUID {row['original_study_uid']} 已归属患者 "
+                        f"{row['original_patient_id']}，本批声明患者 {wanted}，整批拒绝"
+                    )
 
         # 4) 确定性派生全部新 UID 与新 PatientID
         for original_uid, role in plan.value_roles.items():
@@ -324,6 +357,36 @@ def persist_mappings(plan: BatchPlan) -> None:
                 )
     finally:
         conn.close()
+
+
+def claim_study_ownership(conn, plan: BatchPlan, batch_id: str) -> None:
+    """在发布事务（调用方负责 BEGIN IMMEDIATE）中权威登记检查归属。
+
+    IMMEDIATE 事务串行化所有批次发布：先做归属一致性校验，再插入。
+    并发首传同一 Study 但 PatientID 不同时，只有一个批次能提交成功，
+    其余在此整批拒绝。失败/中断批次走不到这里，绝不占用归属。
+    归属与批次 ready 状态在同一事务内提交，要么一起成立要么一起回滚。
+    """
+    for study_uid, patient_id in plan.study_owners.items():
+        # INSERT OR IGNORE：同归属重传/并发重复声明直接跳过；不同归属的
+        # 并发插入会被主键挡下，随后的回读校验负责把它转为整批拒绝。
+        conn.execute(
+            "INSERT OR IGNORE INTO study_ownership"
+            "(original_study_uid, original_patient_id, batch_id) "
+            "VALUES(?,?,?)",
+            (study_uid, patient_id, batch_id),
+        )
+        row = conn.execute(
+            "SELECT original_patient_id FROM study_ownership "
+            "WHERE original_study_uid=?",
+            (study_uid,),
+        ).fetchone()
+        if row is not None and row["original_patient_id"] != patient_id:
+            raise BatchRejected(
+                f"原 StudyInstanceUID {study_uid} 已归属患者 "
+                f"{row['original_patient_id']}，与本批患者 {patient_id} "
+                f"冲突，整批拒绝"
+            )
 
 
 def process_plan(plan: BatchPlan, batch_id: str) -> None:
